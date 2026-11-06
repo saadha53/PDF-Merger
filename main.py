@@ -2,6 +2,7 @@ import os
 import sys
 
 from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
 from gui.main_window import MainWindow
@@ -20,6 +21,8 @@ def main() -> int:
         window.setWindowIcon(QIcon(icon_ico))
 
     window.show()
+    if "--smoke-test" in sys.argv:
+        QTimer.singleShot(250, app.quit)
     return app.exec()
 
 

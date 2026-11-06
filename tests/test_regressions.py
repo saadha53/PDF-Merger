@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import QApplication
 from pypdf import PdfReader, PdfWriter
 
 from core.pdf_merger import PdfMergerService
+from core.page_ranges import parse_page_order, parse_split_groups
 from gui.main_window import MainWindow, SortableItem
 
 
@@ -39,6 +40,42 @@ class MergeTests(unittest.TestCase):
         self.service.merge([self.b, self.a], self.out, lambda *args: progress.append(args))
         self.assertEqual([float(p.mediabox.width) for p in PdfReader(self.out).pages], [300, 100, 200])
         self.assertEqual([p[:2] for p in progress], [(1, 2), (2, 2)])
+
+    def test_page_order_parser(self):
+        self.assertEqual(parse_page_order("3, 1-2, 3-2", 3), [2, 0, 1, 2, 1])
+        self.assertEqual(parse_page_order("", 3), [0, 1, 2])
+        for text in ["0", "4", "1,", "a", "-1", "1-4", "1--2"]:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_page_order(text, 3)
+        self.assertEqual(parse_split_groups("", 3), [[0], [1], [2]])
+        self.assertEqual(parse_split_groups("2-1; 3", 3), [[1, 0], [2]])
+        with self.assertRaises(ValueError):
+            parse_split_groups("1;", 3)
+
+    def test_rearrange_extract_and_repeat_pages(self):
+        self.service.merge([self.a, self.b], self.out, page_orders=[[1, 0, 1], [0]])
+        self.assertEqual([float(p.mediabox.width) for p in PdfReader(self.out).pages],
+                         [200, 100, 200, 300])
+        with self.assertRaises(ValueError):
+            self.service.merge([self.a], self.root / "bad.pdf", page_orders=[[2]])
+        self.assertFalse((self.root / "bad.pdf").exists())
+
+    def test_split_outputs_and_conflict_preflight(self):
+        outputs = [str(self.root / "part1.pdf"), str(self.root / "part2.pdf")]
+        Path(outputs[1]).write_bytes(b"keep")
+        with self.assertRaises(FileExistsError):
+            self.service.split(self.a, outputs, [[1], [0]])
+        self.assertFalse(Path(outputs[0]).exists())
+        self.service.split(self.a, outputs, [[1], [0]], overwrite=True)
+        self.assertEqual([float(PdfReader(p).pages[0].mediabox.width) for p in outputs], [200, 100])
+
+    def test_split_invalid_plan_creates_no_files(self):
+        outputs = [str(self.root / "part1.pdf"), str(self.root / "part2.pdf")]
+        with self.assertRaises(ValueError):
+            self.service.split(self.a, outputs, [[0], [9]])
+        self.assertFalse(any(Path(p).exists() for p in outputs))
+        with self.assertRaises(ValueError):
+            self.service.split(self.a, [str(self.a)], [[0]], overwrite=True)
 
     def test_empty_input_rejected(self):
         with self.assertRaises(ValueError):
@@ -169,6 +206,45 @@ class WindowTests(unittest.TestCase):
             self.assertIsNone(self.window._thread)
             self.assertTrue(self.window.centralWidget().isEnabled())
             self.assertEqual(len(PdfReader(Path(self.temp.name) / (name + ".pdf")).pages), 10)
+
+    def wait_for_worker(self):
+        deadline = time.monotonic() + 10
+        while self.window._thread is not None and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        self.assertIsNone(self.window._thread)
+
+    def test_rearrange_button_updates_counts_and_exports(self):
+        self.select([0])
+        self.assertTrue(self.window.pages_button.isEnabled())
+        with patch("gui.main_window.QInputDialog.getText", return_value=("3, 1", True)):
+            self.window.pages_button.click()
+        self.assertEqual(self.window.list_widget.item(0, 4).text(), "3, 1")
+        self.assertEqual(self.window.list_widget.item(0, 5).text(), "2")
+        self.assertEqual(self.window.total_pages_label.text(), "Total pages: 9")
+        self.window.dest_input.setText(self.temp.name)
+        self.window._merge_pdfs()
+        self.wait_for_worker()
+        self.assertEqual(len(PdfReader(Path(self.temp.name) / "Merge.pdf").pages), 9)
+
+    def test_split_button_exports_groups(self):
+        self.select([0])
+        self.window.dest_input.setText(self.temp.name)
+        with patch("gui.main_window.QInputDialog.getText", return_value=("3-2; 1", True)):
+            self.window.split_button.click()
+        self.wait_for_worker()
+        self.assertEqual(len(PdfReader(Path(self.temp.name) / "c_part_001.pdf").pages), 2)
+        self.assertEqual(len(PdfReader(Path(self.temp.name) / "c_part_002.pdf").pages), 1)
+        self.assertEqual(len(PdfReader(self.paths[0]).pages), 3)
+
+    def test_page_dialog_cancel_preserves_selection(self):
+        self.select([0])
+        with patch("gui.main_window.QInputDialog.getText", return_value=("2", False)):
+            self.window.pages_button.click()
+        self.assertEqual(self.window.list_widget.item(0, 4).text(), "All")
+        self.select([0, 1])
+        self.assertFalse(self.window.pages_button.isEnabled())
+        self.assertFalse(self.window.split_button.isEnabled())
 
     def test_close_is_blocked_during_merge(self):
         self.window._thread = object()

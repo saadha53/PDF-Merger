@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
@@ -34,6 +35,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.pdf_merger import PdfMergerService
+from core.page_ranges import parse_page_order, parse_split_groups
 from utils.file_utils import (
     format_bytes,
     format_modified,
@@ -53,6 +55,7 @@ class PdfItem:
     pages: int
     size_bytes: int
     modified_ts: float
+    page_order: str = ""
 
 
 class SortableItem(QTableWidgetItem):
@@ -399,20 +402,29 @@ class MergeWorker(QObject):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, paths: List[str], output_path: str, overwrite: bool = False) -> None:
+    def __init__(self, paths: List[str], output_path: str, overwrite: bool = False,
+                 page_orders=None, split_outputs=None, split_groups=None) -> None:
         super().__init__()
         self._paths = paths
         self._output_path = output_path
         self._overwrite = overwrite
         self._merger = PdfMergerService()
+        self._page_orders = page_orders
+        self._split_outputs = split_outputs
+        self._split_groups = split_groups
 
     def run(self) -> None:
         try:
-            self._merger.merge(self._paths, self._output_path, self._emit_progress,
-                               overwrite=self._overwrite)
-            self.finished.emit(True, "PDFs merged successfully.")
+            if self._split_outputs is not None:
+                self._merger.split(self._paths[0], self._split_outputs, self._split_groups,
+                                   self._emit_progress, overwrite=self._overwrite)
+                self.finished.emit(True, f"Saved {len(self._split_outputs)} split PDFs.")
+            else:
+                self._merger.merge(self._paths, self._output_path, self._emit_progress,
+                                   overwrite=self._overwrite, page_orders=self._page_orders)
+                self.finished.emit(True, "PDF saved successfully.")
         except Exception as exc:
-            self.finished.emit(False, f"Merge failed: {exc}")
+            self.finished.emit(False, f"PDF operation failed: {exc}")
 
     def _emit_progress(self, current: int, total: int, path: str) -> None:
         self.progress.emit(current, total, os.path.basename(path))
@@ -481,6 +493,16 @@ class MainWindow(QMainWindow):
         toolbar_layout.addWidget(self.move_up_button)
         toolbar_layout.addWidget(self.move_down_button)
         toolbar_layout.addStretch(1)
+        self.pages_button = QToolButton()
+        self.pages_button.setText("Rearrange Pages")
+        self.pages_button.clicked.connect(self._edit_page_order)
+        self.split_button = QToolButton()
+        self.split_button.setText("Split PDF")
+        self.split_button.clicked.connect(self._split_pdf)
+        toolbar_layout.addWidget(self.pages_button)
+        toolbar_layout.addWidget(self.split_button)
+        self._set_tool_button_state(self.pages_button, False)
+        self._set_tool_button_state(self.split_button, False)
 
         self.add_button.clicked.connect(self._add_files_dialog)
         self.remove_button.clicked.connect(self._remove_selected)
@@ -512,7 +534,7 @@ class MainWindow(QMainWindow):
 
         self.overwrite_checkbox = QCheckBox("Overwrite if file already exists")
 
-        self.merge_button = QPushButton("Merge PDFs")
+        self.merge_button = QPushButton("Merge / Save PDF")
         self.merge_button.setObjectName("MergeButton")
         self.merge_button.clicked.connect(self._merge_pdfs)
 
@@ -611,8 +633,9 @@ class MainWindow(QMainWindow):
         pages_item.setData(Qt.ItemDataRole.DisplayRole, str(item.pages))
         pages_item.setData(Qt.ItemDataRole.UserRole, item.pages)
 
-        ranges_item = QTableWidgetItem("")
-        selected_pages_item = QTableWidgetItem("")
+        ranges_item = QTableWidgetItem(item.page_order or "All")
+        selected_pages_item = SortableItem(str(item.pages))
+        selected_pages_item.setData(Qt.ItemDataRole.UserRole, item.pages)
 
         modified_item = SortableItem()
         modified_item.setData(Qt.ItemDataRole.DisplayRole, format_modified(item.modified_ts))
@@ -653,6 +676,77 @@ class MainWindow(QMainWindow):
         self._update_action_state()
         self._show_status("List cleared.")
 
+    def _selected_pdf(self):
+        selection = self.list_widget.selectionModel().selectedRows()
+        if len(selection) != 1 or self._thread is not None:
+            return None
+        row = selection[0].row()
+        path = self.list_widget.item(row, 1).data(Qt.ItemDataRole.UserRole)
+        return row, self._items[normalize_path(path)]
+
+    def _edit_page_order(self) -> None:
+        selected = self._selected_pdf()
+        if selected is None:
+            return
+        row, item = selected
+        text = item.page_order
+        while True:
+            text, accepted = QInputDialog.getText(
+                self, "Rearrange / extract pages",
+                f"{os.path.basename(item.path)} - {item.pages} pages\n"
+                "Enter pages in output order, e.g. 3, 1-2, 5-4.\n"
+                "Blank restores all pages. Repeated pages are allowed.\n"
+                "Then use Merge / Save PDF to export.", text=text)
+            if not accepted:
+                return
+            try:
+                pages = parse_page_order(text, item.pages)
+            except ValueError as exc:
+                self._show_message("Invalid pages", str(exc), QMessageBox.Icon.Warning)
+                continue
+            item.page_order = text.strip()
+            was_sorting = self.list_widget.isSortingEnabled()
+            self.list_widget.setSortingEnabled(False)
+            self.list_widget.item(row, 4).setText(item.page_order or "All")
+            count_item = self.list_widget.item(row, 5)
+            count_item.setText(str(len(pages)))
+            count_item.setData(Qt.ItemDataRole.UserRole, len(pages))
+            self.list_widget.setSortingEnabled(was_sorting)
+            self._update_total_pages()
+            return
+
+    def _split_pdf(self) -> None:
+        selected = self._selected_pdf()
+        if selected is None:
+            return
+        _, item = selected
+        destination = self.dest_input.text().strip()
+        if not os.path.isdir(destination):
+            self._show_status("Select an existing destination folder before splitting.")
+            return
+        text = ""
+        while True:
+            text, accepted = QInputDialog.getText(
+                self, "Split PDF",
+                f"{os.path.basename(item.path)} - {item.pages} original pages\n"
+                "Separate output groups with semicolons: 1-3; 4-6; 7\n"
+                "Leave blank for one PDF per page. Uses original page numbers.\n"
+                "Saves as <source>_part_001.pdf, <source>_part_002.pdf, etc.\n"
+                "The overwrite checkbox applies to all split outputs.", text=text)
+            if not accepted:
+                return
+            try:
+                groups = parse_split_groups(text, item.pages)
+            except ValueError as exc:
+                self._show_message("Invalid split", str(exc), QMessageBox.Icon.Warning)
+                continue
+            break
+        stem = os.path.splitext(os.path.basename(item.path))[0]
+        outputs = [os.path.join(destination, f"{stem}_part_{i:03d}.pdf")
+                   for i in range(1, len(groups) + 1)]
+        self._start_worker(MergeWorker([item.path], "", self.overwrite_checkbox.isChecked(),
+                                       split_outputs=outputs, split_groups=groups), len(groups))
+
     def _merge_pdfs(self) -> None:
         if self._thread is not None:
             return
@@ -686,10 +780,15 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self._settings.setValue("output/last_dir", destination)
+        page_orders = [parse_page_order(self._items[normalize_path(path)].page_order,
+                                       self._items[normalize_path(path)].pages) for path in paths]
+        self._start_worker(MergeWorker(paths, output_path, self.overwrite_checkbox.isChecked(),
+                                       page_orders=page_orders), len(paths))
 
-        self._progress_dialog = QProgressDialog("Merging PDFs...", "Cancel", 0, len(paths), self)
-        self._progress_dialog.setWindowTitle("Merging")
+    def _start_worker(self, worker: MergeWorker, total: int) -> None:
+        self._settings.setValue("output/last_dir", self.dest_input.text().strip())
+        self._progress_dialog = QProgressDialog("Processing PDFs...", "Cancel", 0, total, self)
+        self._progress_dialog.setWindowTitle("Processing PDFs")
         self._progress_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
         self._progress_dialog.setCancelButton(None)
         self._progress_dialog.setAutoClose(False)
@@ -699,7 +798,7 @@ class MainWindow(QMainWindow):
 
         self.centralWidget().setEnabled(False)
         self._thread = QThread(self)
-        self._worker = MergeWorker(paths, output_path, self.overwrite_checkbox.isChecked())
+        self._worker = worker
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._update_progress)
@@ -714,7 +813,7 @@ class MainWindow(QMainWindow):
         if self._progress_dialog:
             self._progress_dialog.setMaximum(total)
             self._progress_dialog.setValue(current)
-            self._progress_dialog.setLabelText(f"Merging {filename} ({current}/{total})...")
+            self._progress_dialog.setLabelText(f"Processing {filename} ({current}/{total})...")
 
     def _merge_finished(self, ok: bool, message: str) -> None:
         if self._progress_dialog:
@@ -735,7 +834,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self._thread is not None:
-            self._show_status("Wait for the merge to finish before closing.")
+            self._show_status("Wait for the PDF operation to finish before closing.")
             event.ignore()
             return
         super().closeEvent(event)
@@ -769,6 +868,8 @@ class MainWindow(QMainWindow):
         can_move_up = has_selection and min_row > 0
         can_move_down = has_selection and max_row < self.list_widget.rowCount() - 1
 
+        self._set_tool_button_state(self.pages_button, len(selection) == 1)
+        self._set_tool_button_state(self.split_button, len(selection) == 1)
         self._set_tool_button_state(self.remove_button, has_selection)
         self._set_tool_button_state(self.move_up_button, can_move_up)
         self._set_tool_button_state(self.move_down_button, can_move_down)
@@ -806,7 +907,8 @@ class MainWindow(QMainWindow):
         self.list_widget.setSortingEnabled(was_sorting)
 
     def _update_total_pages(self) -> None:
-        total = sum(item.pages for item in self._items.values())
+        total = sum(len(parse_page_order(item.page_order, item.pages))
+                    for item in self._items.values() if item.pages)
         self.total_pages_label.setText(f"Total pages: {total}")
 
     def _apply_theme(self) -> None:

@@ -15,7 +15,9 @@ Use Python 3.10 or later:
 
 Select one file and click **Rearrange Pages** to choose pages in output order,
 for example `3, 1-2, 5-4`. Blank restores all pages; repeated pages are allowed.
-The table shows the selection and output page count. Click **Merge / Save PDF**
+The dialog previews page order and validates ranges as you type. You can also
+double-click a document to open it. The table shows the selection and output page
+count. Click **Save PDF** (one file) or **Merge PDFs** (multiple files)
 to export one rearranged PDF or combine the selected pages from all listed files.
 
 To split, select one file, choose a destination folder, and click **Split PDF**.
@@ -25,6 +27,9 @@ Split groups refer to original page numbers, independent of the rearrange settin
 The overwrite checkbox applies to every split output. Existing-file conflicts and
 invalid groups are checked before writing; if a later disk error interrupts a
 split, the error reports how many files were saved.
+
+Use **Add PDFs** or Ctrl+O to choose files. Selecting rows reveals which actions
+are available; full source paths and modification dates appear in filename tooltips.
 
 Password-protected PDFs must be unlocked before adding them.
 Input PDFs cannot be replaced by the output. Existing output files are replaced

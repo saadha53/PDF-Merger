@@ -19,9 +19,12 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QHBoxLayout,
+    QGridLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
-    QInputDialog,
+    QDialog,
+    QDialogButtonBox,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
@@ -77,7 +80,7 @@ class FileListWidget(QTableWidget):
         self.setObjectName("DropArea")
         self.setColumnCount(7)
         self.setHorizontalHeaderLabels(
-            ["#", "Name", "Size", "Pages", "Page ranges", "Selected pages", "Modified"]
+            ["#", "Document", "Size", "Pages", "Page order", "Output pages", "Modified"]
         )
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
@@ -103,12 +106,14 @@ class FileListWidget(QTableWidget):
         self.horizontalHeader().setSortIndicatorShown(True)
         self.horizontalHeader().sectionClicked.connect(self._handle_header_sort)
         self.verticalHeader().setVisible(False)
-        self.setShowGrid(True)
+        self.setShowGrid(False)
+        self.verticalHeader().setDefaultSectionSize(42)
+        self.setAccessibleName("PDF files in output order")
         self.setColumnWidth(0, 36)
         self._last_sort_section: int | None = None
         self._sort_orders: dict[int, Qt.SortOrder] = {}
 
-        self._placeholder = QLabel("Drag and drop PDF files here", self.viewport())
+        self._placeholder = QLabel("Drop your PDFs here\n\nOr choose Add PDFs above to get started", self.viewport())
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setObjectName("DropLabel")
         self._placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -129,8 +134,12 @@ class FileListWidget(QTableWidget):
         if not self._placeholder:
             return
         size = self.viewport().size()
-        box_width = min(520, max(360, int(size.width() * 0.6)))
-        box_height = 90
+        box_width = min(520, max(220, size.width() - 48))
+        box_height = min(140, max(40, size.height() - 16))
+        self._placeholder.setText(
+            "Drop PDFs here or choose Add PDFs" if box_height < 110 else
+            "Drop your PDFs here\n\nOr choose Add PDFs above to get started"
+        )
         x = max(0, (size.width() - box_width) // 2)
         y = max(0, (size.height() - box_height) // 2)
         self._placeholder.setGeometry(x, y, box_width, box_height)
@@ -398,6 +407,72 @@ class FileListWidget(QTableWidget):
     indicatorOpacity = pyqtProperty(float, _get_indicator_opacity, _set_indicator_opacity)
 
 
+class PageSelectionDialog(QDialog):
+    def __init__(self, parent, title, description, text, page_count, split=False):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(540)
+        self.page_count = page_count
+        self.split = split
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+        heading = QLabel(title)
+        heading.setObjectName("SectionTitle")
+        layout.addWidget(heading)
+        help_text = QLabel(description)
+        help_text.setWordWrap(True)
+        help_text.setObjectName("Muted")
+        layout.addWidget(help_text)
+        self.edit = QLineEdit(text)
+        self.edit.setAccessibleName("Split page groups" if split else "Page order")
+        self.edit.setPlaceholderText("Example: 1-3; 4-6" if split else "Example: 3, 1-2, 5-4")
+        layout.addWidget(self.edit)
+        self.preview = QLabel()
+        self.preview.setWordWrap(True)
+        self.preview.setMinimumHeight(48)
+        self.preview.setAccessibleName("Output preview or validation error")
+        layout.addWidget(self.preview)
+        reset = QToolButton()
+        reset.setText("One file per page" if split else "Restore all pages")
+        reset.clicked.connect(self.edit.clear)
+        layout.addWidget(reset, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Split and save" if split else "Apply page order")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.edit.textChanged.connect(self._validate)
+        self._validate()
+        self.edit.setFocus()
+
+    def _validate(self):
+        try:
+            if self.split:
+                groups = parse_split_groups(self.edit.text(), self.page_count)
+                summary = f"Ready to save {len(groups)} PDFs, containing {sum(map(len, groups))} pages in total."
+            else:
+                pages = parse_page_order(self.edit.text(), self.page_count)
+                sequence = ", ".join(str(p + 1) for p in pages[:18])
+                if len(pages) > 18:
+                    sequence += ", ..."
+                summary = f"{len(pages)} output pages\nOrder: {sequence}"
+            self.preview.setText(summary)
+            self.preview.setStyleSheet("color: #a8d9bb;")
+            valid = True
+        except ValueError as exc:
+            self.preview.setText(f"Check your pages: {exc}")
+            self.preview.setStyleSheet("color: #ffb4ae;")
+            valid = False
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(valid)
+
+    @staticmethod
+    def getText(parent, title, description, *, text="", page_count, split=False):
+        dialog = PageSelectionDialog(parent, title, description, text, page_count, split)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        return dialog.edit.text(), accepted
+
+
 class MergeWorker(QObject):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(bool, str)
@@ -437,8 +512,8 @@ class MainWindow(QMainWindow):
         icon_ico = resource_path(os.path.join("gui", "assets", "app_icon.ico"))
         if os.path.exists(icon_ico):
             self.setWindowIcon(QIcon(icon_ico))
-        self.resize(900, 650)
-        self.setMinimumSize(720, 520)
+        self.resize(1040, 780)
+        self.setMinimumSize(800, 660)
 
         self._settings = QSettings("PDFMergePro", "PDF Merge Pro")
         self._dark_mode = True
@@ -453,111 +528,148 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         central = QWidget()
-        main_layout = QVBoxLayout()
-        main_layout.setContentsMargins(16, 16, 16, 16)
-        main_layout.setSpacing(12)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(24, 22, 24, 12)
+        main_layout.setSpacing(14)
+
+        title = QLabel("PDF Merger")
+        title.setObjectName("PageTitle")
+        subtitle = QLabel("Combine documents, reorder pages, or split a PDF into separate files.")
+        subtitle.setObjectName("Muted")
+        subtitle.setWordWrap(True)
+        main_layout.addWidget(title)
+        main_layout.addWidget(subtitle)
+
+        toolbar_layout = QHBoxLayout()
+        section = QLabel("1   Organize your files")
+        section.setObjectName("SectionTitle")
+        toolbar_layout.addWidget(section)
+        toolbar_layout.addStretch()
+        self.add_button = QToolButton()
+        self.add_button.setText("Add PDFs")
+        self.add_button.setObjectName("AddButton")
+        self.add_button.setShortcut("Ctrl+O")
+        self.add_button.setToolTip("Choose PDF files (Ctrl+O)")
+        self.clear_button = QToolButton()
+        self.clear_button.setText("Clear all")
+        self.clear_button.setToolTip("Remove every file from this list; original files are kept")
+        toolbar_layout.addWidget(self.add_button)
+        toolbar_layout.addWidget(self.clear_button)
+        main_layout.addLayout(toolbar_layout)
 
         self.list_widget = FileListWidget()
         self.list_widget.external_files_dropped.connect(self._handle_files_dropped)
         self.list_widget.rows_reordered.connect(self._reindex_rows)
         self.list_widget.rows_reordered.connect(self._update_action_state)
         self.list_widget.selectionModel().selectionChanged.connect(self._update_action_state)
+        header = self.list_widget.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column, width in [(0, 40), (2, 80), (3, 65), (4, 145), (5, 105)]:
+            self.list_widget.setColumnWidth(column, width)
+        self.list_widget.setColumnHidden(6, True)
+        self.list_widget.setMinimumHeight(120)
+        self.list_widget.cellDoubleClicked.connect(lambda row, col: self._edit_page_order())
+        main_layout.addWidget(self.list_widget, 1)
 
-        toolbar_layout = QHBoxLayout()
-        self.add_button = QToolButton()
-        self.add_button.setText("Add")
-        self.add_button.setObjectName("ToolButton")
-
-        self.clear_button = QToolButton()
-        self.clear_button.setText("Clear")
-        self.clear_button.setObjectName("ToolButton")
-
+        actions = QHBoxLayout()
         self.remove_button = QToolButton()
         self.remove_button.setText("Remove")
-        self.remove_button.setObjectName("ToolButtonDisabled")
-        self.remove_button.setEnabled(False)
-
+        self.remove_button.setToolTip("Remove selected files from the list")
         self.move_up_button = QToolButton()
-        self.move_up_button.setText("Move Up")
-        self.move_up_button.setObjectName("ToolButtonDisabled")
-        self.move_up_button.setEnabled(False)
-
+        self.move_up_button.setText("Move up")
         self.move_down_button = QToolButton()
-        self.move_down_button.setText("Move Down")
-        self.move_down_button.setObjectName("ToolButtonDisabled")
-        self.move_down_button.setEnabled(False)
-
-        toolbar_layout.addWidget(self.add_button)
-        toolbar_layout.addWidget(self.clear_button)
-        toolbar_layout.addWidget(self.remove_button)
-        toolbar_layout.addWidget(self.move_up_button)
-        toolbar_layout.addWidget(self.move_down_button)
-        toolbar_layout.addStretch(1)
+        self.move_down_button.setText("Move down")
         self.pages_button = QToolButton()
-        self.pages_button.setText("Rearrange Pages")
-        self.pages_button.clicked.connect(self._edit_page_order)
+        self.pages_button.setText("Rearrange pages")
+        self.pages_button.setToolTip("Select one PDF to change page order or extract pages. Double-click also works.")
         self.split_button = QToolButton()
         self.split_button.setText("Split PDF")
-        self.split_button.clicked.connect(self._split_pdf)
-        toolbar_layout.addWidget(self.pages_button)
-        toolbar_layout.addWidget(self.split_button)
-        self._set_tool_button_state(self.pages_button, False)
-        self._set_tool_button_state(self.split_button, False)
+        self.split_button.setToolTip("Select one PDF to save page groups as separate files")
+        for button in (self.remove_button, self.move_up_button, self.move_down_button):
+            actions.addWidget(button)
+        actions.addStretch()
+        actions.addWidget(self.pages_button)
+        actions.addWidget(self.split_button)
+        main_layout.addLayout(actions)
+
+        self.selection_hint = QLabel("Add PDFs to begin. Files are saved in the order shown above.")
+        self.selection_hint.setObjectName("Muted")
+        self.selection_hint.setWordWrap(True)
+        main_layout.addWidget(self.selection_hint)
 
         self.add_button.clicked.connect(self._add_files_dialog)
         self.remove_button.clicked.connect(self._remove_selected)
         self.clear_button.clicked.connect(self._clear_list)
         self.move_up_button.clicked.connect(lambda: self._move_selection(-1))
         self.move_down_button.clicked.connect(lambda: self._move_selection(1))
+        self.pages_button.clicked.connect(self._edit_page_order)
+        self.split_button.clicked.connect(self._split_pdf)
 
+        output_card = QWidget()
+        output_card.setObjectName("OutputCard")
+        output = QGridLayout(output_card)
+        output.setContentsMargins(18, 16, 18, 16)
+        output.setHorizontalSpacing(12)
+        output.setVerticalSpacing(10)
+        output_title = QLabel("2   Choose where to save")
+        output_title.setObjectName("SectionTitle")
+        output.addWidget(output_title, 0, 0, 1, 3)
+        dest_label = QLabel("Destination folder")
+        name_label = QLabel("File name (.pdf)")
+        self.dest_input = QLineEdit()
+        self.dest_input.setMinimumHeight(40)
+        self.dest_input.setAccessibleName("Destination folder")
+        self.dest_input.setPlaceholderText("Choose a folder for your PDFs")
+        last_dir = self._settings.value("output/last_dir", "", type=str)
+        if last_dir and os.path.isdir(last_dir):
+            self.dest_input.setText(last_dir)
+        self.dest_browse_button = QToolButton()
+        self.dest_browse_button.setText("Browse...")
+        self.dest_browse_button.clicked.connect(self._browse_destination)
+        self.filename_input = QLineEdit("Merge")
+        self.filename_input.setMinimumHeight(40)
+        self.filename_input.setAccessibleName("Output PDF file name")
+        self.filename_input.setPlaceholderText("Merge")
+        self.filename_input.setMinimumWidth(130)
+        self.filename_input.setMaximumWidth(240)
+        dest_label.setBuddy(self.dest_input)
+        name_label.setBuddy(self.filename_input)
+        output.addWidget(dest_label, 1, 0)
+        output.addWidget(name_label, 1, 2)
+        output.addWidget(self.dest_input, 2, 0)
+        output.addWidget(self.dest_browse_button, 2, 1)
+        output.addWidget(self.filename_input, 2, 2)
+        output.setColumnStretch(0, 1)
+        self.overwrite_checkbox = QCheckBox("Replace existing output files")
+        self.overwrite_checkbox.setToolTip("Original input PDFs are always protected")
+        output.addWidget(self.overwrite_checkbox, 3, 0, 1, 3)
+        main_layout.addWidget(output_card)
+
+        export_row = QHBoxLayout()
         self.total_pages_label = QLabel("Total pages: 0")
         self.total_pages_label.setObjectName("TotalPagesLabel")
-
-        dest_layout = QHBoxLayout()
-        dest_label = QLabel("Destination folder:")
-        self.dest_input = QLineEdit()
-        self.dest_input.setPlaceholderText("Select a folder...")
-        self.dest_browse_button = QToolButton()
-        self.dest_browse_button.setText("Browse")
-        self.dest_browse_button.setObjectName("ToolButton")
-        self.dest_browse_button.clicked.connect(self._browse_destination)
-        dest_layout.addWidget(dest_label)
-        dest_layout.addWidget(self.dest_input, 1)
-        dest_layout.addWidget(self.dest_browse_button)
-
-        name_layout = QHBoxLayout()
-        name_label = QLabel("File name:")
-        self.filename_input = QLineEdit("Merge")
-        self.filename_input.setPlaceholderText("Merge")
-        name_layout.addWidget(name_label)
-        name_layout.addWidget(self.filename_input, 1)
-
-        self.overwrite_checkbox = QCheckBox("Overwrite if file already exists")
-
+        self.file_count_label = QLabel("0 files")
+        self.file_count_label.setObjectName("Muted")
+        export_row.addWidget(self.total_pages_label)
+        export_row.addWidget(self.file_count_label)
+        export_row.addStretch()
         self.merge_button = QPushButton("Merge / Save PDF")
         self.merge_button.setObjectName("MergeButton")
+        self.merge_button.setMinimumWidth(210)
         self.merge_button.clicked.connect(self._merge_pdfs)
+        export_row.addWidget(self.merge_button)
+        main_layout.addLayout(export_row)
 
-        self.created_by_label = QLabel("Created by Shafiq")
+        self.created_by_label = QLabel("Created by Shafiq  /  Files stay on your computer")
         self.created_by_label.setObjectName("CreatedByLabel")
-        self.created_by_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
-
-        main_layout.addLayout(toolbar_layout)
-        main_layout.addWidget(self.list_widget, 1)
-        main_layout.addWidget(self.total_pages_label)
-        main_layout.addLayout(dest_layout)
-        main_layout.addLayout(name_layout)
-        main_layout.addWidget(self.overwrite_checkbox)
-        main_layout.addWidget(self.merge_button)
         main_layout.addWidget(self.created_by_label)
-
-        central.setLayout(main_layout)
         self.setCentralWidget(central)
-
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-
+        self.status_bar.showMessage("Ready")
         self.menuBar().setVisible(False)
+        self._update_action_state()
 
     def _add_files_dialog(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -624,6 +736,7 @@ class MainWindow(QMainWindow):
 
         name_item = QTableWidgetItem(os.path.basename(item.path))
         name_item.setData(Qt.ItemDataRole.UserRole, item.path)
+        name_item.setToolTip(f"{item.path}\nModified: {format_modified(item.modified_ts)}")
 
         size_item = SortableItem()
         size_item.setData(Qt.ItemDataRole.DisplayRole, format_bytes(item.size_bytes))
@@ -691,12 +804,12 @@ class MainWindow(QMainWindow):
         row, item = selected
         text = item.page_order
         while True:
-            text, accepted = QInputDialog.getText(
+            text, accepted = PageSelectionDialog.getText(
                 self, "Rearrange / extract pages",
                 f"{os.path.basename(item.path)} - {item.pages} pages\n"
                 "Enter pages in output order, e.g. 3, 1-2, 5-4.\n"
                 "Blank restores all pages. Repeated pages are allowed.\n"
-                "Then use Merge / Save PDF to export.", text=text)
+                "Then use Save PDF or Merge PDFs to export.", text=text, page_count=item.pages)
             if not accepted:
                 return
             try:
@@ -726,13 +839,14 @@ class MainWindow(QMainWindow):
             return
         text = ""
         while True:
-            text, accepted = QInputDialog.getText(
+            text, accepted = PageSelectionDialog.getText(
                 self, "Split PDF",
                 f"{os.path.basename(item.path)} - {item.pages} original pages\n"
                 "Separate output groups with semicolons: 1-3; 4-6; 7\n"
                 "Leave blank for one PDF per page. Uses original page numbers.\n"
                 "Saves as <source>_part_001.pdf, <source>_part_002.pdf, etc.\n"
-                "The overwrite checkbox applies to all split outputs.", text=text)
+                "The replace-files setting applies to all split outputs.", text=text,
+                page_count=item.pages, split=True)
             if not accepted:
                 return
             try:
@@ -873,6 +987,19 @@ class MainWindow(QMainWindow):
         self._set_tool_button_state(self.remove_button, has_selection)
         self._set_tool_button_state(self.move_up_button, can_move_up)
         self._set_tool_button_state(self.move_down_button, can_move_down)
+        count = self.list_widget.rowCount()
+        self.clear_button.setEnabled(count > 0)
+        self.merge_button.setEnabled(count > 0)
+        self.merge_button.setText("Save PDF" if count == 1 else "Merge PDFs" if count else "Merge / Save PDF")
+        self.file_count_label.setText(f"{count} file{'s' if count != 1 else ''}")
+        if len(selection) == 1:
+            self.selection_hint.setText("1 file selected. Rearrange its pages, split it, or move it in the list.")
+        elif selection:
+            self.selection_hint.setText(f"{len(selection)} files selected. Move or remove them together.")
+        elif count:
+            self.selection_hint.setText("Drag rows to change file order. Select one PDF to rearrange or split its pages.")
+        else:
+            self.selection_hint.setText("Add PDFs to begin. Files are saved in the order shown above.")
 
     def _move_selection(self, direction: int) -> None:
         selection = self.list_widget.selectionModel().selectedRows()
@@ -912,92 +1039,45 @@ class MainWindow(QMainWindow):
         self.total_pages_label.setText(f"Total pages: {total}")
 
     def _apply_theme(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow { background: #1b1c22; color: #e5e7eb; }
-            QLabel { color: #e5e7eb; }
-            QLabel#DropLabel {
-                color: #9aa0a6;
-                background: #1b1c22;
-                border: 2px dashed #4b5563;
-                border-radius: 12px;
-                font-size: 16px;
-            }
-            QTableWidget#DropArea {
-                background: #111318;
-                border: 1px solid #2f333d;
-                border-radius: 6px;
-            }
-            QTableWidget {
-                background: #111318;
-                border: 1px solid #2f333d;
-                color: #e5e7eb;
-                gridline-color: #2a2f3a;
-                outline: none;
-            }
-            QTableWidget::item { border: none; }
-            QTableWidget::item:hover { background: transparent; }
-            QTableWidget::item:focus { outline: none; }
-            QTableWidget::item:selected { outline: none; }
-            QTableWidget::item:selected:active { outline: none; }
-            QTableWidget::item:selected:focus { outline: none; }
-            QTableWidget::item:selected { background: #1e3a8a; color: #e5e7eb; }
-            QHeaderView::section {
-                background: #20242c;
-                color: #e5e7eb;
-                border: 1px solid #2f333d;
-                padding: 4px 6px;
-                font-weight: 600;
-            }
-            QToolButton#ToolButton {
-                background: #242834;
-                color: #e5e7eb;
-                border: 1px solid #2f333d;
-                padding: 4px 12px;
-                border-radius: 8px;
-            }
-            QToolButton#ToolButton:hover { background: #2c3140; }
-            QToolButton#ToolButtonDisabled {
-                background: #242834;
-                color: #8b93a1;
-                border: 1px solid #2f333d;
-                padding: 4px 12px;
-                border-radius: 8px;
-            }
-            QLineEdit {
-                background: #111318;
-                color: #e5e7eb;
-                border: 1px solid #2f333d;
-                padding: 4px 8px;
-                border-radius: 6px;
-            }
-            QCheckBox {
-                color: #e5e7eb;
-                spacing: 8px;
-            }
-            QLabel#TotalPagesLabel {
-                color: #e5e7eb;
-                background: #20242c;
-                border: 1px solid #2f333d;
-                border-radius: 8px;
-                padding: 4px 10px;
-            }
-            QLabel#CreatedByLabel {
-                color: #9aa0a6;
-                font-size: 11px;
-                padding: 2px 0 0 0;
-            }
-            QPushButton#MergeButton {
-                background: #ef4444;
-                border: 1px solid #dc2626;
-                color: #ffffff;
-                padding: 8px 14px;
-                border-radius: 8px;
-            }
-            QPushButton#MergeButton:hover { background: #f05252; }
-            QStatusBar { background: #1b1c22; color: #9aa0a6; }
-            """
-        )
+        self.setStyleSheet("""
+            QWidget { font-family: 'Segoe UI'; font-size: 13px; color: #e7edf6; }
+            QMainWindow, QDialog, QMessageBox { background: #151922; }
+            QLabel { background: transparent; }
+            QLabel#PageTitle { font-size: 28px; font-weight: 700; }
+            QLabel#SectionTitle { font-size: 14px; font-weight: 600; }
+            QLabel#Muted, QLabel#CreatedByLabel { color: #a7b3c5; }
+            QLabel#CreatedByLabel { font-size: 11px; }
+            QWidget#OutputCard { background: #1c2330; border: 1px solid #333e50; border-radius: 10px; }
+            QLabel#DropLabel { color: #a7b3c5; background: #1c2330; border: 2px dashed #46546b;
+                              border-radius: 12px; font-size: 15px; }
+            QTableWidget { background: #191f2a; border: 1px solid #333e50; border-radius: 8px;
+                           selection-background-color: #284775; selection-color: #ffffff; }
+            QTableWidget::item { padding: 6px; border-bottom: 1px solid #252f40; }
+            QTableWidget::item:selected { background: #284775; color: #ffffff; }
+            QTableWidget::item:focus { border: 1px solid #8ab4ff; }
+            QHeaderView::section { background: #222b3a; color: #b9c6d9; border: none;
+                                   padding: 11px 6px; font-weight: 600; }
+            QToolButton, QPushButton { background: #252f40; border: 1px solid #455269;
+                                       border-radius: 7px; padding: 8px 13px; min-height: 20px; }
+            QToolButton:hover, QPushButton:hover { background: #34425a; border-color: #7086a7; }
+            QToolButton:pressed, QPushButton:pressed { background: #19253b; }
+            QToolButton:disabled, QPushButton:disabled { color: #8591a4; background: #1d2532; border-color: #303b4d; }
+            QToolButton:focus, QPushButton:focus, QLineEdit:focus { border: 2px solid #98bfff; }
+            QToolButton#AddButton { background: #284775; border-color: #5883c0; }
+            QPushButton#MergeButton { background: #376ad9; border-color: #6b99fa; color: #ffffff;
+                                      font-weight: 600; padding: 11px 22px; }
+            QPushButton#MergeButton:hover { background: #4279ed; }
+            QPushButton#MergeButton:disabled { background: #253249; border-color: #3a4a64; color: #9aaac3; }
+            QLineEdit { background: #141b27; border: 1px solid #455269; border-radius: 6px;
+                        padding: 9px 10px; selection-background-color: #376ad9; }
+            QCheckBox { spacing: 9px; padding-top: 4px; }
+            QCheckBox:focus { outline: 1px solid #98bfff; }
+            QLabel#TotalPagesLabel { font-weight: 600; padding-right: 8px; }
+            QStatusBar { background: #151922; color: #a7b3c5; }
+            QToolTip { background: #24324a; color: #ffffff; border: 1px solid #7086a7; padding: 6px; }
+            QProgressBar { background: #141b27; border: 1px solid #455269; border-radius: 5px; text-align: center; }
+            QProgressBar::chunk { background: #376ad9; }
+        """)
 
     def _show_status(self, message: str) -> None:
         self.statusBar().showMessage(message, 5000)

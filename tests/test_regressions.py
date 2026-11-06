@@ -13,7 +13,8 @@ from pypdf import PdfReader, PdfWriter
 
 from core.pdf_merger import PdfMergerService
 from core.page_ranges import parse_page_order, parse_split_groups
-from gui.main_window import MainWindow, SortableItem
+from gui.main_window import MainWindow, SortableItem, PageSelectionDialog
+from PyQt6.QtWidgets import QDialogButtonBox
 
 
 def pdf(path, widths):
@@ -217,7 +218,7 @@ class WindowTests(unittest.TestCase):
     def test_rearrange_button_updates_counts_and_exports(self):
         self.select([0])
         self.assertTrue(self.window.pages_button.isEnabled())
-        with patch("gui.main_window.QInputDialog.getText", return_value=("3, 1", True)):
+        with patch("gui.main_window.PageSelectionDialog.getText", return_value=("3, 1", True)):
             self.window.pages_button.click()
         self.assertEqual(self.window.list_widget.item(0, 4).text(), "3, 1")
         self.assertEqual(self.window.list_widget.item(0, 5).text(), "2")
@@ -230,7 +231,7 @@ class WindowTests(unittest.TestCase):
     def test_split_button_exports_groups(self):
         self.select([0])
         self.window.dest_input.setText(self.temp.name)
-        with patch("gui.main_window.QInputDialog.getText", return_value=("3-2; 1", True)):
+        with patch("gui.main_window.PageSelectionDialog.getText", return_value=("3-2; 1", True)):
             self.window.split_button.click()
         self.wait_for_worker()
         self.assertEqual(len(PdfReader(Path(self.temp.name) / "c_part_001.pdf").pages), 2)
@@ -239,12 +240,37 @@ class WindowTests(unittest.TestCase):
 
     def test_page_dialog_cancel_preserves_selection(self):
         self.select([0])
-        with patch("gui.main_window.QInputDialog.getText", return_value=("2", False)):
+        with patch("gui.main_window.PageSelectionDialog.getText", return_value=("2", False)):
             self.window.pages_button.click()
         self.assertEqual(self.window.list_widget.item(0, 4).text(), "All")
         self.select([0, 1])
         self.assertFalse(self.window.pages_button.isEnabled())
         self.assertFalse(self.window.split_button.isEnabled())
+
+    def test_page_dialog_live_validation(self):
+        dialog = PageSelectionDialog(self.window, "Page order", "Choose pages", "", 4)
+        button = dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.assertTrue(button.isEnabled())
+        dialog.edit.setText("5")
+        self.assertFalse(button.isEnabled())
+        self.assertIn("between 1 and 4", dialog.preview.text())
+        dialog.edit.setText("4-2, 1")
+        self.assertTrue(button.isEnabled())
+        self.assertIn("4, 3, 2, 1", dialog.preview.text())
+        dialog.close()
+
+    def test_split_dialog_previews_output_count(self):
+        dialog = PageSelectionDialog(self.window, "Split", "Choose groups", "1-2; 3-4", 4, True)
+        self.assertIn("2 PDFs", dialog.preview.text())
+        dialog.edit.clear()
+        self.assertIn("4 PDFs", dialog.preview.text())
+        dialog.close()
+
+    def test_empty_list_disables_export(self):
+        self.window._clear_list()
+        self.assertFalse(self.window.merge_button.isEnabled())
+        self.assertFalse(self.window.clear_button.isEnabled())
+        self.assertIn("Add PDFs", self.window.selection_hint.text())
 
     def test_close_is_blocked_during_merge(self):
         self.window._thread = object()

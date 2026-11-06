@@ -509,6 +509,10 @@ class MainWindow(QMainWindow):
         self.merge_button.setObjectName("MergeButton")
         self.merge_button.clicked.connect(self._merge_pdfs)
 
+        self.created_by_label = QLabel("Created by Shafiq")
+        self.created_by_label.setObjectName("CreatedByLabel")
+        self.created_by_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+
         main_layout.addLayout(toolbar_layout)
         main_layout.addWidget(self.list_widget, 1)
         main_layout.addWidget(self.total_pages_label)
@@ -516,6 +520,7 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(name_layout)
         main_layout.addWidget(self.overwrite_checkbox)
         main_layout.addWidget(self.merge_button)
+        main_layout.addWidget(self.created_by_label)
 
         central.setLayout(main_layout)
         self.setCentralWidget(central)
@@ -826,6 +831,11 @@ class MainWindow(QMainWindow):
                 border: 1px solid #2f333d;
                 border-radius: 8px;
                 padding: 4px 10px;
+            }
+            QLabel#CreatedByLabel {
+                color: #9aa0a6;
+                font-size: 11px;
+                padding: 2px 0 0 0;
             }
             QPushButton#MergeButton {
                 background: #ef4444;

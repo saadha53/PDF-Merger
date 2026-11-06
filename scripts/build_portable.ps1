@@ -8,6 +8,10 @@ python -m PyInstaller `
   --onefile `
   -y `
   --name "PDFMerger" `
-  --icon "gui\\assets\\app_icon.ico" `
-  --add-data "gui\\assets\\app_icon.ico;gui\\assets" `
+  --icon "gui/assets/app_icon.ico" `
+  --add-data "gui/assets/app_icon.ico;gui/assets" `
   main.py
+
+if ($LASTEXITCODE -ne 0) {
+  throw "PyInstaller failed with exit code $LASTEXITCODE"
+}

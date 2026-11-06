@@ -11,6 +11,7 @@ from PyQt6.QtCore import (
     pyqtProperty,
     QPropertyAnimation,
     QRect,
+    QItemSelectionModel,
 )
 from PyQt6.QtGui import QCursor, QDrag, QIcon, QPainter, QPalette, QPixmap
 from PyQt6.QtWidgets import (
@@ -65,6 +66,7 @@ class SortableItem(QTableWidgetItem):
 
 class FileListWidget(QTableWidget):
     external_files_dropped = pyqtSignal(list)
+    rows_reordered = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -93,6 +95,7 @@ class FileListWidget(QTableWidget):
         self.horizontalHeader().setSectionResizeMode(5, self.horizontalHeader().ResizeMode.Interactive)
         self.horizontalHeader().setSectionResizeMode(6, self.horizontalHeader().ResizeMode.Interactive)
         self.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.horizontalHeader().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         self.setSortingEnabled(True)
         self.horizontalHeader().setSortIndicatorShown(True)
         self.horizontalHeader().sectionClicked.connect(self._handle_header_sort)
@@ -310,23 +313,19 @@ class FileListWidget(QTableWidget):
         if not rows:
             return
 
-        min_row = rows[0]
-        max_row = rows[-1]
-        if min_row <= target_row <= max_row + 1:
-            return
+        rows = sorted(set(rows))
 
         row_data: list[list[QTableWidgetItem | None]] = []
         for row in rows:
             items: list[QTableWidgetItem | None] = []
             for col in range(self.columnCount()):
                 item = self.item(row, col)
-                items.append(item.clone() if item else None)
+                items.append(SortableItem(item) if isinstance(item, SortableItem)
+                             else QTableWidgetItem(item) if item else None)
             row_data.append(items)
 
         self.setUpdatesEnabled(False)
-        was_sorting = self.isSortingEnabled()
-        if was_sorting:
-            self.setSortingEnabled(False)
+        self.setSortingEnabled(False)
         try:
             for row in reversed(rows):
                 self.removeRow(row)
@@ -345,17 +344,21 @@ class FileListWidget(QTableWidget):
             if not preview:
                 self.clearSelection()
                 for row in range(target_row, target_row + len(row_data)):
-                    self.selectRow(row)
+                    self.selectionModel().select(
+                        self.model().index(row, 0),
+                        QItemSelectionModel.SelectionFlag.Select |
+                        QItemSelectionModel.SelectionFlag.Rows,
+                    )
                 self._update_placeholder()
         finally:
-            if was_sorting:
-                self.setSortingEnabled(True)
             self.setUpdatesEnabled(True)
+        self.rows_reordered.emit()
 
     # Preview reordering is intentionally disabled to prevent jitter.
 
     def _to_viewport_pos(self, pos):
-        return self.viewport().mapFrom(self, pos)
+        # Item-view drag events already use viewport coordinates.
+        return pos
 
     def _handle_header_sort(self, section: int) -> None:
         if not self.isSortingEnabled():
@@ -396,15 +399,17 @@ class MergeWorker(QObject):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, paths: List[str], output_path: str) -> None:
+    def __init__(self, paths: List[str], output_path: str, overwrite: bool = False) -> None:
         super().__init__()
         self._paths = paths
         self._output_path = output_path
+        self._overwrite = overwrite
         self._merger = PdfMergerService()
 
     def run(self) -> None:
         try:
-            self._merger.merge(self._paths, self._output_path, self._emit_progress)
+            self._merger.merge(self._paths, self._output_path, self._emit_progress,
+                               overwrite=self._overwrite)
             self.finished.emit(True, "PDFs merged successfully.")
         except Exception as exc:
             self.finished.emit(False, f"Merge failed: {exc}")
@@ -442,6 +447,8 @@ class MainWindow(QMainWindow):
 
         self.list_widget = FileListWidget()
         self.list_widget.external_files_dropped.connect(self._handle_files_dropped)
+        self.list_widget.rows_reordered.connect(self._reindex_rows)
+        self.list_widget.rows_reordered.connect(self._update_action_state)
         self.list_widget.selectionModel().selectionChanged.connect(self._update_action_state)
 
         toolbar_layout = QHBoxLayout()
@@ -567,8 +574,13 @@ class MainWindow(QMainWindow):
                 self._show_message("PDF Error", f"Skipped {os.path.basename(path)}: {error}", QMessageBox.Icon.Warning)
                 continue
 
-            size_bytes = get_file_size_bytes(path)
-            modified_ts = get_file_modified_timestamp(path)
+            try:
+                size_bytes = get_file_size_bytes(path)
+                modified_ts = get_file_modified_timestamp(path)
+            except OSError as exc:
+                self._show_message("PDF Error", f"Skipped {os.path.basename(path)}: {exc}",
+                                   QMessageBox.Icon.Warning)
+                continue
             item = PdfItem(path=path, pages=pages, size_bytes=size_bytes, modified_ts=modified_ts)
             self._items[norm] = item
             self._add_list_item(item)
@@ -580,6 +592,8 @@ class MainWindow(QMainWindow):
         self._update_action_state()
 
     def _add_list_item(self, item: PdfItem) -> None:
+        was_sorting = self.list_widget.isSortingEnabled()
+        self.list_widget.setSortingEnabled(False)
         row = self.list_widget.add_row()
 
         index_item = SortableItem()
@@ -611,6 +625,7 @@ class MainWindow(QMainWindow):
         self.list_widget.setItem(row, 4, ranges_item)
         self.list_widget.setItem(row, 5, selected_pages_item)
         self.list_widget.setItem(row, 6, modified_item)
+        self.list_widget.setSortingEnabled(was_sorting)
 
         self._update_total_pages()
 
@@ -639,6 +654,8 @@ class MainWindow(QMainWindow):
         self._show_status("List cleared.")
 
     def _merge_pdfs(self) -> None:
+        if self._thread is not None:
+            return
         paths = self._ordered_paths()
         if not paths:
             self._show_status("Add PDFs before merging.")
@@ -649,7 +666,14 @@ class MainWindow(QMainWindow):
             self._show_status("Select a destination folder.")
             return
 
+        if not os.path.isdir(destination):
+            self._show_status("Select an existing destination folder.")
+            return
+
         filename = self.filename_input.text().strip() or "Merge"
+        if filename in (".", "..") or any(c in filename for c in '<>:"/\\|?*'):
+            self._show_status("Enter a file name without folders or invalid characters.")
+            return
         if not filename.lower().endswith(".pdf"):
             filename = f"{filename}.pdf"
         output_path = os.path.join(destination, filename)
@@ -668,11 +692,14 @@ class MainWindow(QMainWindow):
         self._progress_dialog.setWindowTitle("Merging")
         self._progress_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
         self._progress_dialog.setCancelButton(None)
+        self._progress_dialog.setAutoClose(False)
+        self._progress_dialog.setAutoReset(False)
         self._progress_dialog.setValue(0)
         self._progress_dialog.show()
 
-        self._thread = QThread()
-        self._worker = MergeWorker(paths, output_path)
+        self.centralWidget().setEnabled(False)
+        self._thread = QThread(self)
+        self._worker = MergeWorker(paths, output_path, self.overwrite_checkbox.isChecked())
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._update_progress)
@@ -680,6 +707,7 @@ class MainWindow(QMainWindow):
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(self._thread_finished)
         self._thread.start()
 
     def _update_progress(self, current: int, total: int, filename: str) -> None:
@@ -691,12 +719,26 @@ class MainWindow(QMainWindow):
     def _merge_finished(self, ok: bool, message: str) -> None:
         if self._progress_dialog:
             self._progress_dialog.close()
+            self._progress_dialog.deleteLater()
+            self._progress_dialog = None
         if ok:
             self._show_message("Success", message, QMessageBox.Icon.Information)
             self._show_status(message)
         else:
             self._show_message("Error", message, QMessageBox.Icon.Critical)
             self._show_status(message)
+
+    def _thread_finished(self) -> None:
+        self._thread = None
+        self._worker = None
+        self.centralWidget().setEnabled(True)
+
+    def closeEvent(self, event) -> None:
+        if self._thread is not None:
+            self._show_status("Wait for the merge to finish before closing.")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _ordered_paths(self) -> List[str]:
         paths = []
@@ -751,11 +793,17 @@ class MainWindow(QMainWindow):
         self._update_action_state()
 
     def _reindex_rows(self) -> None:
+        was_sorting = self.list_widget.isSortingEnabled()
+        self.list_widget.setSortingEnabled(False)
         for row in range(self.list_widget.rowCount()):
             index_item = self.list_widget.item(row, 0)
             if index_item:
                 index_item.setData(Qt.ItemDataRole.DisplayRole, str(row + 1))
                 index_item.setData(Qt.ItemDataRole.UserRole, row + 1)
+        if was_sorting and self.list_widget.horizontalHeader().sortIndicatorSection() == 0:
+            # The new sequence numbers describe the current order; do not reverse it.
+            self.list_widget.horizontalHeader().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
+        self.list_widget.setSortingEnabled(was_sorting)
 
     def _update_total_pages(self) -> None:
         total = sum(item.pages for item in self._items.values())

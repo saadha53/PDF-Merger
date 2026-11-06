@@ -1,0 +1,182 @@
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PyQt6.QtCore import Qt, QItemSelectionModel
+from PyQt6.QtGui import QCloseEvent
+from PyQt6.QtWidgets import QApplication
+from pypdf import PdfReader, PdfWriter
+
+from core.pdf_merger import PdfMergerService
+from gui.main_window import MainWindow, SortableItem
+
+
+def pdf(path, widths):
+    with PdfWriter() as writer:
+        for width in widths:
+            writer.add_blank_page(width=width, height=100)
+        writer.write(path)
+
+
+class MergeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.a = self.root / "a.pdf"
+        self.b = self.root / "b.pdf"
+        self.out = self.root / "out.pdf"
+        pdf(self.a, [100, 200])
+        pdf(self.b, [300])
+        self.service = PdfMergerService()
+
+    def test_order_and_progress(self):
+        progress = []
+        self.service.merge([self.b, self.a], self.out, lambda *args: progress.append(args))
+        self.assertEqual([float(p.mediabox.width) for p in PdfReader(self.out).pages], [300, 100, 200])
+        self.assertEqual([p[:2] for p in progress], [(1, 2), (2, 2)])
+
+    def test_empty_input_rejected(self):
+        with self.assertRaises(ValueError):
+            self.service.merge([], self.out)
+        self.assertFalse(self.out.exists())
+
+    def test_input_cannot_be_overwritten(self):
+        before = self.a.read_bytes()
+        with self.assertRaises(ValueError):
+            self.service.merge([self.a], self.a, overwrite=True)
+        self.assertEqual(self.a.read_bytes(), before)
+
+    def test_write_failure_preserves_destination_and_cleans_temp(self):
+        self.out.write_bytes(b"original")
+        def fail(writer, stream):
+            stream.write(b"partial")
+            raise OSError("disk full")
+        with patch.object(PdfWriter, "write", fail):
+            with self.assertRaises(OSError):
+                self.service.merge([self.a], self.out, overwrite=True)
+        self.assertEqual(self.out.read_bytes(), b"original")
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_existing_and_racing_outputs_are_preserved(self):
+        self.out.write_bytes(b"original")
+        with self.assertRaises(FileExistsError):
+            self.service.merge([self.a], self.out)
+        self.out.unlink()
+        with self.assertRaises(FileExistsError):
+            self.service.merge([self.a], self.out, lambda *args: self.out.write_bytes(b"raced"))
+        self.assertEqual(self.out.read_bytes(), b"raced")
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_explicit_overwrite(self):
+        self.out.write_bytes(b"original")
+        self.service.merge([self.a], self.out, overwrite=True)
+        self.assertEqual(len(PdfReader(self.out).pages), 2)
+
+    def test_corrupt_input_does_not_publish(self):
+        self.b.write_bytes(b"not a pdf")
+        with self.assertRaises(Exception):
+            self.service.merge([self.a, self.b], self.out)
+        self.assertFalse(self.out.exists())
+
+
+class WindowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.window = MainWindow()
+        self.window._show_message = lambda *args: None
+        self.addCleanup(self.window.close)
+        self.paths = []
+        for name, pages in [("c", 3), ("a", 1), ("b", 2), ("d", 4)]:
+            path = str(Path(self.temp.name) / (name + ".pdf"))
+            pdf(path, [100] * pages)
+            self.paths.append(path)
+        self.window._handle_files_dropped(self.paths)
+
+    def select(self, rows):
+        table = self.window.list_widget
+        table.clearSelection()
+        for row in rows:
+            table.selectionModel().select(table.model().index(row, 0),
+                QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+
+    def test_sorted_insert_keeps_rows_intact(self):
+        table = self.window.list_widget
+        table.sortItems(1, Qt.SortOrder.AscendingOrder)
+        path = str(Path(self.temp.name) / "aa.pdf")
+        pdf(path, [100] * 5)
+        self.window._handle_files_dropped([path])
+        for row in range(table.rowCount()):
+            path = table.item(row, 1).data(Qt.ItemDataRole.UserRole)
+            self.assertEqual(int(table.item(row, 3).text()), len(PdfReader(path).pages))
+            self.assertTrue(all(table.item(row, col) is not None for col in range(7)))
+
+    def test_initial_order_matches_added_order(self):
+        self.assertEqual(self.window._ordered_paths(), self.paths)
+
+    def test_removal_after_descending_index_sort_preserves_order(self):
+        table = self.window.list_widget
+        table.sortItems(0, Qt.SortOrder.DescendingOrder)
+        before = self.window._ordered_paths()
+        self.select([1])
+        self.window._remove_selected()
+        self.assertEqual(self.window._ordered_paths(), [before[0], before[2], before[3]])
+
+    def test_manual_move_survives_sorting_and_preserves_selection(self):
+        table = self.window.list_widget
+        table.sortItems(1, Qt.SortOrder.AscendingOrder)
+        before = self.window._ordered_paths()
+        self.select([1, 2])
+        self.window._move_selection(-1)
+        self.assertEqual(self.window._ordered_paths(), [before[1], before[2], before[0], before[3]])
+        self.assertEqual(sorted(i.row() for i in table.selectionModel().selectedRows()), [0, 1])
+        self.assertIsInstance(table.item(0, 3), SortableItem)
+        self.assertEqual([table.item(r, 0).text() for r in range(4)], ["1", "2", "3", "4"])
+
+    def test_disjoint_drag_to_middle(self):
+        before = self.window._ordered_paths()
+        self.window.list_widget._move_rows_to_target([0, 3], 2)
+        self.assertEqual(self.window._ordered_paths(), [before[1], before[0], before[3], before[2]])
+
+    def test_output_filename_cannot_escape_folder(self):
+        self.window.dest_input.setText(self.temp.name)
+        self.window.filename_input.setText("../escaped.pdf")
+        self.window._merge_pdfs()
+        self.assertIsNone(self.window._thread)
+
+    def test_background_merge_finishes_and_can_run_again(self):
+        self.window.dest_input.setText(self.temp.name)
+        for name in ["merged1", "merged2"]:
+            self.window.filename_input.setText(name)
+            self.window._merge_pdfs()
+            self.assertFalse(self.window.centralWidget().isEnabled())
+            dialog = self.window._progress_dialog
+            self.assertFalse(dialog.autoClose())
+            self.window._merge_pdfs()  # A second invocation must not create another worker.
+            deadline = time.monotonic() + 10
+            while self.window._thread is not None and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.005)
+            self.assertIsNone(self.window._thread)
+            self.assertTrue(self.window.centralWidget().isEnabled())
+            self.assertEqual(len(PdfReader(Path(self.temp.name) / (name + ".pdf")).pages), 10)
+
+    def test_close_is_blocked_during_merge(self):
+        self.window._thread = object()
+        event = QCloseEvent()
+        self.window.closeEvent(event)
+        self.assertFalse(event.isAccepted())
+        self.window._thread = None
+
+
+if __name__ == "__main__":
+    unittest.main()
